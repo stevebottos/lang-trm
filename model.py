@@ -1,54 +1,74 @@
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
 import torch
 from torch import nn
-from typing import List
+from typing import List, Dict, Tuple
 import layers
+from dataclasses import dataclass
 
-# This is
-model_config = {
-    "batch_size": 1,
-    "seq_len": 256,
-    "vocab_size": 11,
-    "num_puzzle_identifiers": 0,  # All Sudoku puzzles share same embedding
-    "puzzle_emb_ndim": 0,  # no puzzle stuff
-    "H_cycles": 3,
-    "L_cycles": 6,
-    "H_layers": 0,
-    "L_layers": 2,
-    "hidden_size": 768,
-    "num_heads": 8,
-    "expansion": 4,
-    "pos_encodings": "rope",  # Just always use rope
-    "halt_max_steps": 8,
-    "halt_exploration_prob": 0.1,
-    "forward_dtype": "bfloat16",
-    "mlp_t": False,
-    "puzzle_emb_len": 0,  # No puzzle stuff
-    "no_ACT_continue": True,
-}
+# This is the original just for posterity
+# model_config = {
+#     "batch_size": 1,
+#     "seq_len": 256,
+#     "vocab_size": 11,
+#     "num_puzzle_identifiers": 0,  # All Sudoku puzzles share same embedding
+#     "puzzle_emb_ndim": 0,  # no puzzle stuff
+#     "H_cycles": 3,
+#     "L_cycles": 6,
+#     "H_layers": 0,
+#     "L_layers": 2,
+#     "hidden_size": 768,
+#     "num_heads": 8,
+#     "expansion": 4,
+#     "pos_encodings": "rope",  # Just always use rope
+#     "halt_max_steps": 8,
+#     "halt_exploration_prob": 0.1,
+#     "forward_dtype": "bfloat16",
+#     "mlp_t": False,
+#     "puzzle_emb_len": 0,  # No puzzle stuff
+#     "no_ACT_continue": True,
+# }
 
 # These are fixed, taken from the values in the paper
 HIDDEN_SIZE = 768
 NUM_HEADS = 8
-CAUSAL = False  # TODO: Correct?
+CAUSAL = False  # TODO: Correct? I think so.
 SEQ_LEN = 256
 ROPE_THETA = 10000.0
 EXPANSION = 4
+HALT_MAX_STEPS = 8
+HALT_EXPLORATION_PROB = 0.1
+
+H_CYCLES = 3
+L_CYCLES = 6
+H_LAYERS = 0  # They don't use h model in trm, just keeping this here to avoid confusion
 L_LAYERS = 2
-K_STEPS = 8  # Explicitly say that we want k-steps, no early stopping, can be really easily added later
+
+
+@dataclass
+class TinyRecursiveReasoningModel_ACTV1InnerCarry:
+    z_H: torch.Tensor
+    z_L: torch.Tensor
+
+
+@dataclass
+class TinyRecursiveReasoningModel_ACTV1Carry:
+    inner_carry: TinyRecursiveReasoningModel_ACTV1InnerCarry
+
+    steps: torch.Tensor
+    halted: torch.Tensor
+
+    current_data: Dict[str, torch.Tensor]
 
 
 class BasicBlock(nn.Module):
     def __init__(self):
         super().__init__()
-        self.self_attn = (
-            layers.Attention(
-                hidden_size=HIDDEN_SIZE,
-                head_dim=HIDDEN_SIZE // NUM_HEADS,
-                num_heads=NUM_HEADS,
-                num_key_value_heads=NUM_HEADS,
-                causal=CAUSAL,
-            ),
+        self.self_attn = layers.Attention(
+            hidden_size=HIDDEN_SIZE,
+            head_dim=HIDDEN_SIZE // NUM_HEADS,
+            num_heads=NUM_HEADS,
+            num_key_value_heads=NUM_HEADS,
+            causal=CAUSAL,
         )
 
         self.mlp = layers.SwiGLU(
@@ -88,7 +108,7 @@ class MainStack(nn.Module):
         return hidden_states
 
 
-class LangTRM(nn.Module):
+class LangTRMInnerModule(nn.Module):
     def __init__(self):
         super().__init__()
 
@@ -100,6 +120,8 @@ class LangTRM(nn.Module):
         n_vocab, dim = self.input_embedding.weight.shape
         self.lm_head = nn.Linear(dim, n_vocab, bias=False)
         self.lm_head.weight = self.input_embedding.weight
+
+        self.q_head = layers.CastedLinear(HIDDEN_SIZE, 2, bias=True)
 
         self.tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -123,4 +145,138 @@ class LangTRM(nn.Module):
             persistent=True,
         )
 
-    def forward(self, input_text_ids): ...
+    def empty_carry(self, batch_size: int):
+        return TinyRecursiveReasoningModel_ACTV1InnerCarry(
+            z_H=torch.empty(
+                batch_size,
+                SEQ_LEN,
+                HIDDEN_SIZE,
+                dtype=torch.bfloat16,
+            ),
+            z_L=torch.empty(
+                batch_size,
+                SEQ_LEN,
+                HIDDEN_SIZE,
+                dtype=torch.bfloat16,
+            ),
+        )
+
+    def reset_carry(
+        self,
+        reset_flag: torch.Tensor,
+        carry: TinyRecursiveReasoningModel_ACTV1InnerCarry,
+    ):
+        return TinyRecursiveReasoningModel_ACTV1InnerCarry(
+            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
+            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+        )
+
+    def forward(
+        self,
+        carry: TinyRecursiveReasoningModel_ACTV1InnerCarry,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[
+        TinyRecursiveReasoningModel_ACTV1InnerCarry,
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+    ]:
+        seq_info = dict(cos_sin=self.rotary_emb())
+
+        # This is the pseudocode in the paper
+        input_embeddings = self.input_embedding(batch["inputs"])
+
+        # Forward iterations
+        z_H, z_L = carry.z_H, carry.z_L
+        # H_cycles-1 without grad
+        with torch.no_grad():
+            for _ in range(H_CYCLES - 1):
+                for _ in range(L_CYCLES):
+                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                z_H = self.L_level(z_H, z_L, **seq_info)
+
+        # 1 with grad
+        for _ in range(L_CYCLES):
+            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+        z_H = self.L_level(z_H, z_L, **seq_info)
+        print(z_H.shape)
+
+        # LM Outputs
+        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(
+            z_H=z_H.detach(), z_L=z_L.detach()
+        )  # New carry no grad
+        output = self.lm_head(z_H)[:, self.puzzle_emb_len :]
+        q_logits = self.q_head(z_H[:, 0]).to(
+            torch.float32
+        )  # Q-head; uses the first puzzle_emb position
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+
+
+class LangTRM(nn.Module):
+    """ACT wrapper."""
+
+    def __init__(self):
+        super().__init__()
+        self.inner = LangTRMInnerModule()
+
+    def initial_carry(self, batch: Dict[str, torch.Tensor]):
+        batch_size = batch["inputs"].shape[0]
+
+        return TinyRecursiveReasoningModel_ACTV1Carry(
+            inner_carry=self.inner.empty_carry(
+                batch_size
+            ),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
+            steps=torch.zeros((batch_size,), dtype=torch.int32),
+            halted=torch.ones((batch_size,), dtype=torch.bool),  # Default to halted
+            current_data={k: torch.empty_like(v) for k, v in batch.items()},
+        )
+
+    def forward(
+        self,
+        carry: TinyRecursiveReasoningModel_ACTV1Carry,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
+        # Update data, carry (removing halted sequences)
+        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
+
+        new_steps = torch.where(carry.halted, 0, carry.steps)
+
+        new_current_data = {
+            k: torch.where(
+                carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v
+            )
+            for k, v in carry.current_data.items()
+        }
+
+        # Forward inner model
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(
+            new_inner_carry, new_current_data
+        )
+
+        outputs = {
+            "logits": logits,
+            "q_halt_logits": q_halt_logits,
+            "q_continue_logits": q_continue_logits,
+        }
+
+        with torch.no_grad():
+            # Step
+            new_steps = new_steps + 1
+            is_last_step = new_steps >= HALT_MAX_STEPS
+
+            halted = is_last_step
+
+            # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
+            if self.training and (HALT_MAX_STEPS > 1):
+                # In the original there's a conditional here, but we always want to
+                # handle the halting logic like this
+                halted = halted | (q_halt_logits > 0)
+
+                # Exploration
+                min_halt_steps = (
+                    torch.rand_like(q_halt_logits) < HALT_EXPLORATION_PROB
+                ) * torch.randint_like(new_steps, low=2, high=HALT_MAX_STEPS + 1)
+                halted = halted & (new_steps >= min_halt_steps)
+
+        return TinyRecursiveReasoningModel_ACTV1Carry(
+            new_inner_carry, new_steps, halted, new_current_data
+        ), outputs
