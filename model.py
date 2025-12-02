@@ -201,7 +201,7 @@ class LangTRMInnerModule(nn.Module):
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(
             z_H=z_H.detach(), z_L=z_L.detach()
         )  # New carry no grad
-        output = self.lm_head(z_H)
+        output = self.lm_head(z_H)[:, self.puzzle_emb_len :]
         q_logits = self.q_head(z_H[:, 0]).to(
             torch.float32
         )  # Q-head; uses the first puzzle_emb position
@@ -215,35 +215,16 @@ class LangTRM(nn.Module):
         super().__init__()
         self.inner = LangTRMInnerModule()
 
-    def dummy_carry(self, batch: Dict[str, torch.Tensor], device):
-        """
-        This is just for testing the model, since it needs a carry as input
-        """
+    def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["inputs"].shape[0]
+
         return TinyRecursiveReasoningModel_ACTV1Carry(
-            inner_carry=TinyRecursiveReasoningModel_ACTV1InnerCarry(
-                z_H=torch.empty(
-                    batch_size,
-                    SEQ_LEN,
-                    HIDDEN_SIZE,
-                    dtype=torch.bfloat16,
-                    device=device,
-                ),
-                z_L=torch.empty(
-                    batch_size,
-                    SEQ_LEN,
-                    HIDDEN_SIZE,
-                    dtype=torch.bfloat16,
-                    device=device,
-                ),
-            ),
-            steps=torch.zeros((batch_size,), dtype=torch.int32, device=device),
-            halted=torch.ones(
-                (batch_size,), dtype=torch.bool, device=device
-            ),  # Default to halted
-            current_data={
-                k: torch.zeros_like(v, device=device) for k, v in batch.items()
-            },
+            inner_carry=self.inner.empty_carry(
+                batch_size
+            ),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
+            steps=torch.zeros((batch_size,), dtype=torch.int32),
+            halted=torch.ones((batch_size,), dtype=torch.bool),  # Default to halted
+            current_data={k: torch.empty_like(v) for k, v in batch.items()},
         )
 
     def forward(
