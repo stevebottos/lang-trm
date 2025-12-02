@@ -1,4 +1,4 @@
-from transformers import GPT2Tokenizer, GPT2LMHeadModel
+from transformers import GPT2Tokenizer
 from dataset import SynthDataset
 from model import LangTRM
 import torch
@@ -25,7 +25,6 @@ def tokenize_batch(samples):
     n = len(samples)
     queries = [s.query for s in samples]
     targets = [s.target for s in samples]
-    print()
     tokenized = tokenizer(
         queries + targets,
         add_special_tokens=False,
@@ -38,12 +37,10 @@ def tokenize_batch(samples):
     return tokenized[:n, :], tokenized[n:, :]
 
 
+# Initialize
 queries, targets = tokenize_batch(samples)
-print(queries, targets)
 batch = {"inputs": queries}
-# print(queries.shape, targets.shape)
-carry = model.dummy_carry(batch, device)
-print(carry)
+carry = model.initial_carry(batch, device)
 
-out = model(carry, batch)
-print(out)
+for step in range(10000):
+    out = model(carry, batch)

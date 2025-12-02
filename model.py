@@ -1,4 +1,4 @@
-from transformers import GPT2Tokenizer, GPT2LMHeadModel
+from transformers import GPT2LMHeadModel
 import torch
 from torch import nn
 from typing import List, Dict, Tuple
@@ -45,18 +45,16 @@ L_LAYERS = 2
 
 
 @dataclass
-class TinyRecursiveReasoningModel_ACTV1InnerCarry:
+class States:
     z_H: torch.Tensor
     z_L: torch.Tensor
 
 
 @dataclass
-class TinyRecursiveReasoningModel_ACTV1Carry:
-    inner_carry: TinyRecursiveReasoningModel_ACTV1InnerCarry
-
+class Carry:
+    inner_carry: States
     steps: torch.Tensor
     halted: torch.Tensor
-
     current_data: Dict[str, torch.Tensor]
 
 
@@ -142,38 +140,32 @@ class LangTRMInnerModule(nn.Module):
             persistent=True,
         )
 
-    def empty_carry(self, batch_size: int):
-        return TinyRecursiveReasoningModel_ACTV1InnerCarry(
+    def empty_carry(self, batch_size: int, device):
+        return States(
             z_H=torch.empty(
-                batch_size,
-                SEQ_LEN,
-                HIDDEN_SIZE,
-                dtype=torch.bfloat16,
+                batch_size, SEQ_LEN, HIDDEN_SIZE, dtype=torch.bfloat16, device=device
             ),
             z_L=torch.empty(
-                batch_size,
-                SEQ_LEN,
-                HIDDEN_SIZE,
-                dtype=torch.bfloat16,
+                batch_size, SEQ_LEN, HIDDEN_SIZE, dtype=torch.bfloat16, device=device
             ),
         )
 
     def reset_carry(
         self,
         reset_flag: torch.Tensor,
-        carry: TinyRecursiveReasoningModel_ACTV1InnerCarry,
+        carry: States,
     ):
-        return TinyRecursiveReasoningModel_ACTV1InnerCarry(
+        return States(
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
     def forward(
         self,
-        carry: TinyRecursiveReasoningModel_ACTV1InnerCarry,
+        carry: States,
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[
-        TinyRecursiveReasoningModel_ACTV1InnerCarry,
+        States,
         torch.Tensor,
         Tuple[torch.Tensor, torch.Tensor],
     ]:
@@ -198,10 +190,8 @@ class LangTRMInnerModule(nn.Module):
         print(z_H.shape)
 
         # LM Outputs
-        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(
-            z_H=z_H.detach(), z_L=z_L.detach()
-        )  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len :]
+        new_carry = States(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        output = self.lm_head(z_H)
         q_logits = self.q_head(z_H[:, 0]).to(
             torch.float32
         )  # Q-head; uses the first puzzle_emb position
@@ -215,23 +205,27 @@ class LangTRM(nn.Module):
         super().__init__()
         self.inner = LangTRMInnerModule()
 
-    def initial_carry(self, batch: Dict[str, torch.Tensor]):
+    def initial_carry(self, batch: Dict[str, torch.Tensor], device):
         batch_size = batch["inputs"].shape[0]
 
-        return TinyRecursiveReasoningModel_ACTV1Carry(
+        return Carry(
             inner_carry=self.inner.empty_carry(
-                batch_size
+                batch_size, device
             ),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
-            steps=torch.zeros((batch_size,), dtype=torch.int32),
-            halted=torch.ones((batch_size,), dtype=torch.bool),  # Default to halted
-            current_data={k: torch.empty_like(v) for k, v in batch.items()},
+            steps=torch.zeros((batch_size,), dtype=torch.int32, device=device),
+            halted=torch.ones(
+                (batch_size,), dtype=torch.bool, device=device
+            ),  # Default to halted
+            current_data={
+                k: torch.empty_like(v, device=device) for k, v in batch.items()
+            },
         )
 
     def forward(
         self,
-        carry: TinyRecursiveReasoningModel_ACTV1Carry,
+        carry: Carry,
         batch: Dict[str, torch.Tensor],
-    ) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
+    ) -> Tuple[Carry, Dict[str, torch.Tensor]]:
         # Update data, carry (removing halted sequences)
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
 
@@ -274,6 +268,4 @@ class LangTRM(nn.Module):
                 ) * torch.randint_like(new_steps, low=2, high=HALT_MAX_STEPS + 1)
                 halted = halted & (new_steps >= min_halt_steps)
 
-        return TinyRecursiveReasoningModel_ACTV1Carry(
-            new_inner_carry, new_steps, halted, new_current_data
-        ), outputs
+        return Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
