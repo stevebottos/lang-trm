@@ -187,7 +187,6 @@ class LangTRMInnerModule(nn.Module):
         for _ in range(L_CYCLES):
             z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
-        print(z_H.shape)
 
         # LM Outputs
         new_carry = States(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
