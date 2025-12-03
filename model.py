@@ -44,69 +44,7 @@ H_LAYERS = 0  # They don't use h model in trm, just keeping this here to avoid c
 L_LAYERS = 2
 
 
-@dataclass
-class States:
-    z_H: torch.Tensor
-    z_L: torch.Tensor
-
-
-@dataclass
-class Carry:
-    inner_carry: States
-    steps: torch.Tensor
-    halted: torch.Tensor
-    current_data: Dict[str, torch.Tensor]
-
-
-class BasicBlock(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.self_attn = layers.Attention(
-            hidden_size=HIDDEN_SIZE,
-            head_dim=HIDDEN_SIZE // NUM_HEADS,
-            num_heads=NUM_HEADS,
-            num_key_value_heads=NUM_HEADS,
-            causal=CAUSAL,
-        )
-
-        self.mlp = layers.SwiGLU(
-            hidden_size=HIDDEN_SIZE,
-            expansion=EXPANSION,
-        )
-
-        self.norm_eps = 1e-5
-
-    def forward(
-        self, cos_sin: layers.CosSin, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        hidden_states = layers.rms_norm(
-            hidden_states
-            + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),  # type: ignore
-            variance_epsilon=self.norm_eps,
-        )
-        # Fully Connected
-        out = self.mlp(hidden_states)
-        hidden_states = layers.rms_norm(
-            hidden_states + out, variance_epsilon=self.norm_eps
-        )
-        return hidden_states
-
-
-class MainStack(nn.Module):
-    def __init__(self, layers: List[BasicBlock]):
-        super().__init__()
-        self.layers = torch.nn.ModuleList(layers)
-
-    def forward(
-        self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs
-    ) -> torch.Tensor:
-        hidden_states = hidden_states + input_injection
-        for layer in self.layers:
-            hidden_states = layer(hidden_states=hidden_states, **kwargs)
-        return hidden_states
-
-
-class LangTRMInnerModule(nn.Module):
+class LangTRM(nn.Module):
     def __init__(self):
         super().__init__()
 
@@ -115,156 +53,72 @@ class LangTRMInnerModule(nn.Module):
         pretrained_language_model = GPT2LMHeadModel.from_pretrained("gpt2")
         self.input_embedding = pretrained_language_model.transformer.wte
 
+        # Freeze the pretrained embeddings
+        self.input_embedding.weight.requires_grad = False
+
         n_vocab, dim = self.input_embedding.weight.shape
         self.lm_head = nn.Linear(dim, n_vocab, bias=False)
         self.lm_head.weight = self.input_embedding.weight
 
+        # Since weights are frozen and tied, lm_head shouldn't update them either
+        self.lm_head.weight.requires_grad = False
+
+        # Normalize before lm_head to match expected scale of pretrained weights
+        # GPT-2's final layer produces std~7, so we scale LayerNorm output accordingly
+        self.final_norm = nn.LayerNorm(HIDDEN_SIZE)
+        self.final_scale = nn.Parameter(torch.ones(1) * 3)
+
         self.q_head = layers.CastedLinear(HIDDEN_SIZE, 2, bias=True)
 
-        self.rotary_emb = layers.RotaryEmbedding(
-            dim=HIDDEN_SIZE // NUM_HEADS,
-            max_position_embeddings=SEQ_LEN,
-            base=ROPE_THETA,
+        # Use learned positional embeddings instead of RoPE
+        self.pos_embedding = nn.Embedding(SEQ_LEN, HIDDEN_SIZE)
+        # Initialize with truncated normal
+        with torch.no_grad():
+            layers.trunc_normal_init_(self.pos_embedding.weight, std=0.02)
+
+        # Reasoning Layers - use PyTorch's built-in TransformerEncoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=HIDDEN_SIZE,
+            nhead=NUM_HEADS,
+            dim_feedforward=int(HIDDEN_SIZE * EXPANSION),
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,  # Pre-normalization (normalizes input to each layer)
         )
+        self.L_level = nn.TransformerEncoder(encoder_layer, num_layers=L_LAYERS)
 
-        # Reasoning Layers
-        self.L_level = MainStack(layers=[BasicBlock() for _ in range(L_LAYERS)])
+        self.learned_L_starter = nn.Parameter(torch.zeros(HIDDEN_SIZE))
+        self.learned_H_starter = nn.Parameter(torch.zeros(HIDDEN_SIZE))
 
-        # Initial states
-        self.H_init = nn.Buffer(
-            layers.trunc_normal_init_(torch.empty(HIDDEN_SIZE), std=1),
-            persistent=True,
-        )
-        self.L_init = nn.Buffer(
-            layers.trunc_normal_init_(torch.empty(HIDDEN_SIZE), std=1),
-            persistent=True,
-        )
+    def forward(self, z_H, z_L, input, input_is_embedding=False):
+        if not input_is_embedding:
+            input_embeddings = self.input_embedding(input)
+            # Add learned positional embeddings
+            _, seq_len = input.shape
+            positions = torch.arange(seq_len, device=input_embeddings.device)
+            pos_emb = self.pos_embedding(positions).unsqueeze(
+                0
+            )  # (1, seq_len, hidden_size)
+            input_embeddings = input_embeddings + pos_emb
+        else:
+            input_embeddings = input
 
-    def empty_carry(self, batch_size: int, device):
-        return States(
-            z_H=torch.empty(
-                batch_size, SEQ_LEN, HIDDEN_SIZE, dtype=torch.bfloat16, device=device
-            ),
-            z_L=torch.empty(
-                batch_size, SEQ_LEN, HIDDEN_SIZE, dtype=torch.bfloat16, device=device
-            ),
-        )
-
-    def reset_carry(
-        self,
-        reset_flag: torch.Tensor,
-        carry: States,
-    ):
-        return States(
-            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
-            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
-        )
-
-    def forward(
-        self,
-        carry: States,
-        batch: Dict[str, torch.Tensor],
-    ) -> Tuple[
-        States,
-        torch.Tensor,
-        Tuple[torch.Tensor, torch.Tensor],
-    ]:
-        seq_info = dict(cos_sin=self.rotary_emb())
-
-        # This is the pseudocode in the paper
-        input_embeddings = self.input_embedding(batch["inputs"])
-
-        # Forward iterations
-        z_H, z_L = carry.z_H, carry.z_L
-        # H_cycles-1 without grad
         with torch.no_grad():
             for _ in range(H_CYCLES - 1):
                 for _ in range(L_CYCLES):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-                z_H = self.L_level(z_H, z_L, **seq_info)
+                    # L processes reasoning with input from H and the original input
+                    z_L = self.L_level(z_L + input_embeddings)
+                # H processes the high-level state with input from L
+                z_H = self.L_level(z_H + z_L)
 
         # 1 with grad
         for _ in range(L_CYCLES):
-            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.L_level(z_H, z_L, **seq_info)
+            z_L = self.L_level(z_L + input_embeddings)
+        z_H = self.L_level(z_H + z_L)
 
-        # LM Outputs
-        new_carry = States(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)
-        q_logits = self.q_head(z_H[:, 0]).to(
-            torch.float32
-        )  # Q-head; uses the first puzzle_emb position
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
-
-
-class LangTRM(nn.Module):
-    """ACT wrapper."""
-
-    def __init__(self):
-        super().__init__()
-        self.inner = LangTRMInnerModule()
-
-    def initial_carry(self, batch: Dict[str, torch.Tensor], device):
-        batch_size = batch["inputs"].shape[0]
-
-        return Carry(
-            inner_carry=self.inner.empty_carry(
-                batch_size, device
-            ),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
-            steps=torch.zeros((batch_size,), dtype=torch.int32, device=device),
-            halted=torch.ones(
-                (batch_size,), dtype=torch.bool, device=device
-            ),  # Default to halted
-            current_data={
-                k: torch.empty_like(v, device=device) for k, v in batch.items()
-            },
-        )
-
-    def forward(
-        self,
-        carry: Carry,
-        batch: Dict[str, torch.Tensor],
-    ) -> Tuple[Carry, Dict[str, torch.Tensor]]:
-        # Update data, carry (removing halted sequences)
-        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
-
-        new_steps = torch.where(carry.halted, 0, carry.steps)
-
-        new_current_data = {
-            k: torch.where(
-                carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v
-            )
-            for k, v in carry.current_data.items()
-        }
-
-        # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(
-            new_inner_carry, new_current_data
-        )
-
-        outputs = {
-            "logits": logits,
-            "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits,
-        }
-
-        with torch.no_grad():
-            # Step
-            new_steps = new_steps + 1
-            is_last_step = new_steps >= HALT_MAX_STEPS
-
-            halted = is_last_step
-
-            # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
-            if self.training and (HALT_MAX_STEPS > 1):
-                # In the original there's a conditional here, but we always want to
-                # handle the halting logic like this
-                halted = halted | (q_halt_logits > 0)
-
-                # Exploration
-                min_halt_steps = (
-                    torch.rand_like(q_halt_logits) < HALT_EXPLORATION_PROB
-                ) * torch.randint_like(new_steps, low=2, high=HALT_MAX_STEPS + 1)
-                halted = halted & (new_steps >= min_halt_steps)
-
-        return Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+        # LM Outputs - normalize and scale to match pretrained weight expectations
+        # GPT-2 expects inputs with std~7, not std~1 from LayerNorm
+        embeddings = self.final_norm(z_H) * self.final_scale
+        output = self.lm_head(embeddings)
+        return output, z_H, z_L, embeddings

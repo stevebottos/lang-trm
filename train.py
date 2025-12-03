@@ -3,6 +3,7 @@ from dataset import SynthDataset
 from model import LangTRM
 import torch
 import mlflow
+from copy import deepcopy
 
 
 def prepare_targets_for_loss(
@@ -18,27 +19,27 @@ def prepare_targets_for_loss(
 
 
 def calculate_accuracy(
-    logits: torch.Tensor, targets: torch.Tensor, pad_token_id: int
+    logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -100
 ) -> float:
     """
-    Calculate accuracy where predicted IDs match target IDs, excluding padding tokens.
+    Calculate accuracy where predicted IDs match target IDs, excluding ignore_index positions.
 
     Args:
         logits: (batch_size, seq_len, vocab_size)
-        targets: (batch_size, seq_len)
-        pad_token_id: token ID to exclude from accuracy calculation
+        targets: (batch_size, seq_len) - may contain ignore_index for positions to skip
+        ignore_index: token ID to exclude from accuracy calculation
 
     Returns:
         accuracy as a float between 0 and 1
     """
     predictions = logits.argmax(dim=-1)
 
-    # Create mask for non-padding tokens
-    non_pad_mask = targets != pad_token_id
+    # Create mask for valid (non-ignored) tokens
+    valid_mask = targets != ignore_index
 
-    # Calculate accuracy only on non-padding tokens
-    correct = (predictions == targets) & non_pad_mask
-    accuracy = correct.sum().item() / non_pad_mask.sum().item()
+    # Calculate accuracy only on valid tokens
+    correct = (predictions == targets) & valid_mask
+    accuracy = correct.sum().item() / valid_mask.sum().item()
 
     return accuracy
 
@@ -69,6 +70,15 @@ device = torch.device("cuda")
 
 model = LangTRM().to(device)
 
+# Print model parameter count
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"\n{'=' * 80}")
+print(f"Model Parameters:")
+print(f"  Total parameters: {total_params:,}")
+print(f"  Trainable parameters: {trainable_params:,}")
+print(f"{'=' * 80}\n")
+
 ds = SynthDataset()
 
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
@@ -83,54 +93,83 @@ mlflow.start_run()
 
 global_step = 0
 for step in range(10000):
-    samples = ds.take(16)
-    queries, targets = tokenize_batch(samples)
-    batch = {"inputs": queries}
+    samples = ds.take(8)
+    inputs, targets = tokenize_batch(samples)
+    original_inputs = deepcopy(inputs)
+    input_is_embedding = False
+    # Prepare targets: replace all but the first EOS token with -100 (ignore index)
+    targets = prepare_targets_for_loss(targets, tokenizer.pad_token_id)
 
-    carry = model.initial_carry(batch, device)
+    batch_size, seq_len = inputs.shape
+
+    # Initialize h and l with proper shapes
+    h = model.learned_H_starter.view(1, 1, -1).expand(batch_size, seq_len, -1).clone()
+    l = model.learned_L_starter.view(1, 1, -1).expand(batch_size, seq_len, -1).clone()
+
+    optimizer.zero_grad()
+    total_loss = 0
     for deep_supervision_step in range(8):
-        optimizer.zero_grad()
-        carry, logits = model(carry, batch)
-        logits = logits["logits"]
-        loss = criterion(logits.permute(0, 2, 1), targets)
-        loss.backward()
-        optimizer.step()
+        # Use automatic mixed precision with bfloat16
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            logits, h, l, embeddings = model(h, l, inputs, input_is_embedding)
 
-        # Calculate metrics
-        loss_value = loss.item()
-        accuracy = calculate_accuracy(logits, targets, tokenizer.pad_token_id)
+            # Deep supervision: compute loss at each step
+            step_loss = criterion(logits.permute(0, 2, 1), targets)
+            total_loss = total_loss + step_loss
 
-        # Log to MLflow
-        mlflow.log_metric("loss", loss_value, step=global_step)
-        mlflow.log_metric("accuracy", accuracy, step=global_step)
+            inputs = embeddings
+            input_is_embedding = True
 
-        print(f"Step {global_step}: loss={loss_value:.4f}, accuracy={accuracy:.4f}")
+    # Average the losses across all steps
+    loss = total_loss / 8
+    loss.backward()
+    optimizer.step()
 
-        # Periodically show predictions vs targets
-        if global_step % 10 == 0:
-            print("\n" + "=" * 80)
-            print(f"Example predictions at step {global_step}:")
-            print("=" * 80)
+    # Calculate metrics
+    loss_value = loss.item()
+    accuracy = calculate_accuracy(logits, targets, ignore_index=-100)
 
-            # Get predictions
-            predictions = logits.argmax(dim=-1)
+    # Log to MLflow
+    mlflow.log_metric("loss", loss_value, step=global_step)
+    mlflow.log_metric("accuracy", accuracy, step=global_step)
 
-            # Show first 2 examples from the batch
-            for i in range(min(2, predictions.shape[0])):
-                pred_tokens = predictions[i].tolist()
-                target_tokens = targets[i].tolist()
+    print(f"Step {global_step}: loss={loss_value:.4f}, accuracy={accuracy:.4f}")
 
-                # Decode to text
-                pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=False)
-                target_text = tokenizer.decode(target_tokens, skip_special_tokens=False)
+    # Periodically show predictions vs targets
+    if global_step % 100 == 0:
+        print("\n" + "=" * 80)
+        print(f"Example predictions at step {global_step}:")
+        print("=" * 80)
 
-                print(f"\nExample {i + 1}:")
-                print(f"  Target:     {target_text}")
-                print(f"  Predicted:  {pred_text}")
+        # Get predictions
+        predictions = logits.argmax(dim=-1)
 
-            print("=" * 80 + "\n")
+        # Show first 2 examples from the batch
+        for i in range(min(2, predictions.shape[0])):
+            input_tokens = original_inputs[i].tolist()
+            pred_tokens = predictions[i].tolist()
+            target_tokens = targets[i].tolist()
 
-        global_step += 1
+            # Filter out ignore_index (-100) from targets for decoding
+            target_tokens_filtered = [t for t in target_tokens if t != -100]
+
+            # Decode to text and strip whitespace/newlines, skip special tokens
+            input_text = tokenizer.decode(
+                input_tokens, skip_special_tokens=True
+            ).strip()
+            pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+            target_text = tokenizer.decode(
+                target_tokens_filtered, skip_special_tokens=True
+            ).strip()
+
+            print(f"\nExample {i + 1}:")
+            print(f"  Input:      {input_text}")
+            print(f"  Target:     {target_text}")
+            print(f"  Predicted:  {pred_text}")
+
+        print("=" * 80 + "\n")
+
+    global_step += 1
     # print(new_carry.new_current_data)
 
 mlflow.end_run()
