@@ -6,6 +6,22 @@ load_dotenv(".env")
 
 
 @task
+def get_dolly_dataset(c):
+    output = os.getenv("DS_OUT_DIR")
+    assert os.path.exists(output)  # type: ignore
+
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(
+        repo_id="databricks/databricks-dolly-15k",
+        repo_type="dataset",
+        local_dir=os.path.join(output, "dolly"),
+        local_dir_use_symlinks=False,
+        allow_patterns=["*.json", "*.jsonl"],
+    )
+
+
+@task
 def get_synth_dataset(c):
     output = os.getenv("DS_OUT_DIR")
     assert os.path.exists(output)  # type: ignore
